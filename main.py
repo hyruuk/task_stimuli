@@ -26,6 +26,7 @@ def run(parsed):
             tasks = itertools.islice(tasks, parsed.skip_n_tasks, None)
         else:
             tasks = tasks[parsed.skip_n_tasks:]
+    eeg_backend = "serial" if parsed.serial else ("parallel" if parsed.parallel else "lsl")
     try:
         cli.main_loop(
             tasks,
@@ -43,6 +44,7 @@ def run(parsed):
             parsed.skip_soundcheck,
             parsed.target_ETcalibration,
             parsed.validate_ET,
+            eeg_backend=eeg_backend,
             )
     finally:
         if not parsed.no_force_resolution:
