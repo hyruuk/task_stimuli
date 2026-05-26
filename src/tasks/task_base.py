@@ -113,7 +113,11 @@ class Task(object):
             if meg.MEG_MARKERS_ON_FLIP and self.use_meg:
                 exp_win.callOnFlip(meg.send_signal, self.flags | (flip_idx%2))
             if eeg.EEG_MARKERS_ON_FLIP and self.use_eeg:
-                exp_win.callOnFlip(meg.send_signal, self.flags | (flip_idx%2))
+                marker = self._eeg_marker_value(flip_idx)
+                # Subclasses (VideoGame) return None during gameplay, where
+                # the marker is pushed per emulator-step instead of per-flip.
+                if marker is not None:
+                    exp_win.callOnFlip(eeg.send_signal, marker)
             self._flip_all_windows(exp_win, ctl_win, clearBuffer)
             # increment the progress bar depending on task flip rate
             if self.progress_bar:
@@ -137,6 +141,19 @@ class Task(object):
     def restart(self):
         if hasattr(self, "_restart"):
             self._restart()
+
+    def _eeg_marker_value(self, flip_idx):
+        """Integer pushed onto the marker stream on each flip while ``use_eeg``.
+
+        Default emits :data:`src.shared.eeg.NON_GAME_FLIP` (3) on every
+        non-gameplay PsychoPy flip (instructions, fixation, ratings, Pause
+        tasks). It cannot be confused with lifecycle codes (0..2) or
+        gameplay frame heartbeats (16..255). Returning ``None`` tells the
+        run loop to skip the flip-callback, which the VideoGame subclass
+        uses during gameplay (markers are pushed per emulator-step there,
+        not per-flip).
+        """
+        return eeg.NON_GAME_FLIP
 
     def _log_event(self, event, clock='task'):
         if clock == 'task':

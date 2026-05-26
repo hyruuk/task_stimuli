@@ -1027,5 +1027,8 @@ def fixation_dot(win, **kwargs):
         **kwargs
     }
     circle = visual.Circle(win, lineWidth=radius*.4, **kwargs, radius=radius)
-    dot = visual.Circle(win, units=kwargs["units"], radius=radius*.25, lineWidth=0, fillColor=(-1,-1,-1))
+    # PsychoPy 2024+ rejects lineWidth=0 in Circle (ZeroDivisionError in
+    # _calculateMinEdges). Use a tiny positive value with matching lineColor.
+    dot = visual.Circle(win, units=kwargs["units"], radius=radius*.25,
+                        lineWidth=1, lineColor=(-1,-1,-1), fillColor=(-1,-1,-1))
     return (circle, dot)

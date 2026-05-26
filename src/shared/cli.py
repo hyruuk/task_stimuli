@@ -14,7 +14,7 @@ globalClock = core.MonotonicClock(0)
 logging.setDefaultClock(globalClock)
 
 from . import config  # import first separately
-from . import fmri, eyetracking, utils, meg, config
+from . import fmri, eyetracking, utils, meg, eeg, config
 from ..tasks import task_base, video
 
 
@@ -71,6 +71,9 @@ def run_task(
     # send start trigger/marker to MEG + Biopac (or anything else on parallel port)
     if task.use_meg and not shortcut_evt:
         exp_win.callOnFlip(meg.send_signal, meg.MEG_settings["TASK_START_CODE"])
+    # mirror for the EEG / LSL outlet so analysts can find task boundaries
+    if task.use_eeg and not shortcut_evt:
+        exp_win.callOnFlip(eeg.send_signal, eeg.TASK_START)
 
     if not shortcut_evt:
         shortcut_evt = run_task_loop(
@@ -84,6 +87,8 @@ def run_task(
     # send stop trigger/marker to MEG + Biopac (or anything else on parallel port)
     if task.use_meg and not shortcut_evt:
         exp_win.callOnFlip(meg.send_signal, meg.MEG_settings["TASK_STOP_CODE"])
+    if task.use_eeg and not shortcut_evt:
+        exp_win.callOnFlip(eeg.send_signal, eeg.TASK_STOP)
 
     if eyetracker:
         eyetracker.stop_recording()
@@ -118,6 +123,7 @@ def main_loop(
     skip_soundcheck=False,
     calibration_targets=False,
     validate_eyetrack=False,
+    eeg_backend="lsl",
 ):
 
     # force screen resolution to solve issues with video splitter at scanner
@@ -147,12 +153,27 @@ def main_loop(
 
     exp_win = visual.Window(**config.EXP_WINDOW, monitor=config.EXP_MONITOR)
     exp_win.mouseVisible = False
+    # Pyglet defaults the window caption to sys.argv[0] ("main.py"), which
+    # leaks into the title bar when the WM ends up decorating the window
+    # (e.g. when the requested fullscreen geometry doesn't match the screen).
+    try:
+        exp_win.winHandle.set_caption("task_stimuli")
+    except Exception:
+        pass
 
     if show_ctl_win:
         ctl_win = visual.Window(**config.CTL_WINDOW)
         ctl_win.name = "Stimuli"
     else:
         ctl_win = None
+
+    if use_eeg:
+        # Initialize the marker transport. For LSL this also publishes the
+        # outlet eagerly so consumers (LabRecorder, …) have time to discover
+        # it before the first task starts; for serial / parallel this opens
+        # the device file once so the first marker call doesn't pay the
+        # open() cost.
+        eeg.configure(eeg_backend)
 
     ptt = None
     if enable_ptt:

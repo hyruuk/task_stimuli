@@ -22,7 +22,20 @@ def parse_args():
     )
     parser.add_argument(
         "--eeg",
-        help="Send signal to parallel port to start trigger to EEG and Biopac.",
+        help="Send EEG triggers (default: pylsl outlet).",
+        action="store_true",
+    )
+    eeg_transport = parser.add_mutually_exclusive_group()
+    eeg_transport.add_argument(
+        "--serial",
+        help="With --eeg, send markers to the serial port "
+             "(config.SERIAL_PORT_ADDRESS) as 1-byte writes instead of LSL.",
+        action="store_true",
+    )
+    eeg_transport.add_argument(
+        "--parallel",
+        help="With --eeg, send markers to the parallel port "
+             "(config.PARALLEL_PORT_ADDRESS) as 1-byte writes instead of LSL.",
         action="store_true",
     )
     parser.add_argument(

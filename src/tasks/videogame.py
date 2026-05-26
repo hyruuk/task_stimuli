@@ -5,7 +5,7 @@ import threading
 from psychopy import visual, core, data, logging, event, sound, constants
 from .task_base import Task
 
-from ..shared import config, utils
+from ..shared import config, utils, eeg
 from PIL import Image
 
 import retro
@@ -144,7 +144,12 @@ class VideoGameBase(Task):
 
         super()._setup(exp_win)
 
-        self._first_frame = self.emulator.reset()
+        reset_out = self.emulator.reset()
+        # gymnasium returns (obs, info); legacy gym returns just obs
+        self._first_frame = reset_out[0] if isinstance(reset_out, tuple) else reset_out
+        # stable-retro / SDL initialization steals the OpenGL current context;
+        # restore PsychoPy's window context before creating GL stimuli.
+        exp_win.winHandle.switch_to()
         first_sound_chunk = self.emulator.em.get_audio()
         blockSize = first_sound_chunk.shape[0]
         audio_rate = self.emulator.em.get_audio_rate()
@@ -226,6 +231,18 @@ class VideoGame(VideoGameBase):
         self.post_run_ratings = post_run_ratings
         self.key_set = key_set
         self._completed = False
+        self._emulator_frame = 0
+
+    def _eeg_marker_value(self, flip_idx):
+        # During gameplay, markers are pushed once per emulator.step() inside
+        # `_run_emulator` (so the count matches the bk2 movie even when
+        # frames are dropped before render). Returning None here suppresses
+        # the per-flip callback so we don't double-mark gameplay frames.
+        # Outside of gameplay (instructions, fixation, ratings) we fall
+        # back to the parent class's non-game triangle-wave cycle.
+        if self.flags & 4:
+            return None
+        return super()._eeg_marker_value(flip_idx)
 
     def _instructions(self, exp_win, ctl_win):
 
@@ -264,8 +281,44 @@ class VideoGame(VideoGameBase):
             state=self.state_name,
             scenario=self.scenario,
             record=False,
-            inttype=self.inttype
+            inttype=self.inttype,
+            # stable-retro's default render_mode="human" opens its own SDL
+            # window (titled "main.py" because pyglet inherits sys.argv[0])
+            # showing the emulator framebuffer. We render obs ourselves into
+            # the psychopy texture, so suppress retro's window entirely.
+            render_mode=None,
         )
+        # stable-retro's SDL backend hijacks the OpenGL current context on
+        # every step/reset/load_state; wrap the methods so we restore the
+        # PsychoPy window context after each call.
+        _emu_handle = exp_win.winHandle
+        for _m in ("reset", "step", "load_state", "record_movie",
+                   "stop_record", "close"):
+            _orig = getattr(self.emulator, _m, None)
+            if _orig is None:
+                continue
+            def _wrap(orig=_orig, h=_emu_handle):
+                def wrapped(*a, **kw):
+                    out = orig(*a, **kw)
+                    h.switch_to()
+                    return out
+                return wrapped
+            try:
+                setattr(self.emulator, _m, _wrap())
+            except (AttributeError, TypeError):
+                pass  # method may be read-only on the C extension
+        # also wrap data.load
+        _orig_data_load = self.emulator.data.load
+        def _data_load_wrap(orig=_orig_data_load, h=_emu_handle):
+            def wrapped(*a, **kw):
+                out = orig(*a, **kw)
+                h.switch_to()
+                return out
+            return wrapped
+        try:
+            self.emulator.data.load = _data_load_wrap()
+        except (AttributeError, TypeError):
+            pass
 
         self.game_fps = self.emulator.em.get_screen_rate()
         self._frameInterval = 1.0/self.game_fps
@@ -291,23 +344,38 @@ class VideoGame(VideoGameBase):
         exp_win.winHandle.dispatch_events()
         global _keyPressBuffer, _keyReleaseBuffer
 
-        for k in _keyReleaseBuffer:
-            if k[0] in self.pressed_keys:
-                event = {
-                    'trial_type': 'keypress',
-                    'key': k[0],
-                    'onset': self.pressed_keys[k[0]][1] - self.task_timer._timeAtLastReset + core.monotonicClock._timeAtLastReset,
-                    'offset': k[1] - self.task_timer._timeAtLastReset + core.monotonicClock._timeAtLastReset,
-                    'duration': k[1] - self.pressed_keys[k[0]][1],
-                    'sample': time.monotonic(),
-                    }
-                self._events.append(event)
-                del self.pressed_keys[k[0]]
-        _keyReleaseBuffer.clear()
-        for k in _keyPressBuffer:
-            self.pressed_keys[k[0]] = k
-        self._new_key_pressed = _keyPressBuffer[:] #copy
+        # Interleave press/release events by their pyglet timestamp. Without
+        # this, a press+release tap landing in a single dispatch_events()
+        # cycle would have its release processed before the press (since the
+        # two buffers used to be drained sequentially), so the release would
+        # be dropped and the key would stay "pressed" forever.
+        merged = (
+            [(t, k, "press") for k, t in _keyPressBuffer]
+            + [(t, k, "release") for k, t in _keyReleaseBuffer]
+        )
+        merged.sort()
         _keyPressBuffer.clear()
+        _keyReleaseBuffer.clear()
+
+        clock_offset = (core.monotonicClock._timeAtLastReset
+                        - self.task_timer._timeAtLastReset)
+        self._new_key_pressed = []
+        for t, k, kind in merged:
+            if kind == "press":
+                self.pressed_keys[k] = (k, t)
+                self._new_key_pressed.append((k, t))
+            else:
+                if k in self.pressed_keys:
+                    press_t = self.pressed_keys[k][1]
+                    self._events.append({
+                        "trial_type": "keypress",
+                        "key": k,
+                        "onset": press_t + clock_offset,
+                        "offset": t + clock_offset,
+                        "duration": t - press_t,
+                        "sample": time.monotonic(),
+                    })
+                    del self.pressed_keys[k]
 
     def clear_key_buffers(self):
         global _keyPressBuffer, _keyReleaseBuffer
@@ -321,9 +389,19 @@ class VideoGame(VideoGameBase):
         _done = False
         level_step = 0
         keys = [False] * 12
+        # Reset the emulator-frame counter exposed to _eeg_marker_value, so
+        # the marker stream restarts at zero at the start of each gym-retro game.
+        self._emulator_frame = 0
 
         # flush all keys to avoid unwanted actions
         self.clear_key_buffers()
+        # Make sure the gameplay window owns keyboard focus before we start
+        # polling. Without this, a focus change between tasks can leave key
+        # events going to another window and the controls feel "dead".
+        try:
+            exp_win.winHandle.activate()
+        except Exception:
+            pass
 
         # render the initial frame and audio
         self._render_graphics_sound(
@@ -342,13 +420,40 @@ class VideoGame(VideoGameBase):
         self.flags = 4
         yield True
         self._rep_event = self._events[-1] #save event here to later add duration...
+        # bk2 movies record the initial post-reset state as their first
+        # frame (Movie.step yields N+1 iterations for N emulator.step()
+        # calls). Push GAME_RESET to represent that initial state so the
+        # marker count matches the bk2 frame count exactly (one GAME_RESET
+        # per gameplay segment, then one GAME_FRAME per emulator.step()).
+        if self.use_eeg and eeg.EEG_MARKERS_ON_FLIP:
+            eeg.send_signal(eeg.GAME_RESET, timestamp=eeg.now())
         _nextFrameT = self.task_timer.getTime()
         while not _done:
+            # honor the task's max_duration even when retro never signals done
+            if self.max_duration and self.task_timer.getTime() > self.max_duration:
+                break
             level_step += 1
+            # exposed to _eeg_marker_value, dropped frames included so the
+            # marker tracks the emulator's actual game frame, not just the
+            # ones that made it to the screen.
+            self._emulator_frame = level_step
             _nextFrameT += self._frameInterval
             self._handle_controller_presses(exp_win)
             keys = [k in self.pressed_keys for k in self.key_set]
-            _obs, _rew, _done, self._game_info = self.emulator.step(keys)
+            step_out = self.emulator.step(keys)
+            # bk2 records exactly one frame per emulator.step(); push the
+            # corresponding marker here (not in the per-flip callback) so
+            # the marker count matches the bk2 even when render frames are
+            # dropped below. Capture the LSL clock immediately after step()
+            # so the sample is stamped with the engine's frame-advance time
+            # rather than the (later) push time.
+            if self.use_eeg and eeg.EEG_MARKERS_ON_FLIP:
+                eeg.send_signal(eeg.encode_frame(level_step), timestamp=eeg.now())
+            if len(step_out) == 5:
+                _obs, _rew, _terminated, _truncated, self._game_info = step_out
+                _done = _terminated or _truncated
+            else:
+                _obs, _rew, _done, self._game_info = step_out
             total_reward += _rew
             if _rew > 0:
                 exp_win.logOnFlip(level=logging.EXP, msg="Reward %f" % (total_reward))
@@ -375,6 +480,9 @@ class VideoGame(VideoGameBase):
                 continue # drop frame
             yield False
         self.flags = 0
+        # Stop encoding the emulator frame in the LSL marker once the game
+        # has ended (questionnaire, fixation, ratings should be tagged 0).
+        self._emulator_frame = 0
         self._rep_event['nframes'] = level_step
         self._rep_event['offset'] = self.task_timer.getTime()
         self._rep_event['duration'] = self._rep_event['offset'] - self._rep_event['onset']
@@ -700,7 +808,8 @@ class VideoGameMultiLevel(VideoGame):
                         yield from self._instructions(exp_win, ctl_win)
 
                 for n_repeat in range(self._n_repeats_level):
-                    self._first_frame = self.emulator.reset()
+                    reset_out = self.emulator.reset()
+                    self._first_frame = reset_out[0] if isinstance(reset_out, tuple) else reset_out
                     if self._nlevels > 1:
                         self._set_recording_file()
 
@@ -791,7 +900,12 @@ class VideoGameReplay(VideoGameBase):
                 for i in range(self.emulator.num_buttons):
                     keys.append(self.movie.get_key(i, p))
 
-            _obs, _rew, _done, _info = self.emulator.step(keys)
+            step_out = self.emulator.step(keys)
+            if len(step_out) == 5:
+                _obs, _rew, _terminated, _truncated, _info = step_out
+                _done = _terminated or _truncated
+            else:
+                _obs, _rew, _done, _info = step_out
 
             total_reward += _rew
             if _rew > 0:
